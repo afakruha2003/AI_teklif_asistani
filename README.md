@@ -7,8 +7,8 @@ An AI-driven quotation system for a sales platform selling barcodes scanners, ha
 ## Quick Start
 
 ```bash
-git clone <repo-url>
-cd tbr-backend
+git clone https://github.com/afakruha2003/AI_teklif_asistani
+cd tai-backend
 cp .env.example .env
 # Optional: add OPENAI_API_KEY (fallback mode works if missing)
 
