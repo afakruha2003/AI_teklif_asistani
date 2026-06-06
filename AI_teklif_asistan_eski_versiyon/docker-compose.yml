@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  database:
+    image: postgres:15-alpine
+    container_name: tai-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tai_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tai_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-tai_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-tai_user} -d $${POSTGRES_DB:-tai_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  tai-backend:
+    build: ./tai-backend
+    container_name: tai-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tai_user}:${POSTGRES_PASSWORD:-tai_pass}@database:5432/${POSTGRES_DB:-tai_db}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      database:
+        condition: service_healthy
+    volumes:
+      - ./tai-backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  tai-web:
+    build: ./tai-web
+    container_name: tai-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tai-backend
+    volumes:
+      - ./tai-web:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev"
+
+volumes:
+  postgres_data:
