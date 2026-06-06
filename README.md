@@ -176,7 +176,7 @@ All mutations are performed atomically within `BEGIN SAVEPOINT`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `postgresql+asyncpg://tbr:tbr_secret@db:5432/tbr_db` | Async PostgreSQL |
+| `DATABASE_URL` | `postgresql+asyncpg://tbr:tbr_secret@db:5432/tai_db` | Async PostgreSQL |
 | `GEMIN_API_KEY` | _(empty)_ | If empty, fallback mode is enabled |
 | `GEMINI_MODEL` | `gpt-4o-mini` | Model to use |
 | `SECRET_KEY` | `changeme` | Change in production |

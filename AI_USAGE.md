@@ -1,10 +1,5 @@
 # AI Kullanım Notları (AI_USAGE.md)
 
-## Genel Yaklaşım
-
-Bu projede **Claude (Anthropic, claude-sonnet-4-6)** asistan olarak kullanıldı. Aşağıdaki bileşenler AI destekli üretildi:
-
----
 
 ## AI ile Üretilen Bileşenler
 
