@@ -173,11 +173,13 @@ class GetQuoteInput(BaseModel):
 class AddToQuoteInput(BaseModel):
     quote_id: str
     product_id: str
-    quantity: int = Field(default=1, ge=1)
+    quantity: int = 1
     idempotency_key: Optional[str] = None
+    source_message_id: Optional[str] = None
     max_price_try: Optional[float] = None
     allow_backorder: bool = False
-
+    customer_id: Optional[str] = None
+    
 class UpdateQuoteItemInput(BaseModel):
     quote_id: str
     item_id: str
@@ -185,9 +187,15 @@ class UpdateQuoteItemInput(BaseModel):
 
 class ReplaceWithAlternativeInput(BaseModel):
     quote_id: str
-    item_id: str
-    alternative_product_id: Optional[str] = None
+    item_id: Optional[str] = None
+    from_product_id: Optional[str] = None  
+    to_product_id: Optional[str] = None   
+    alternative_product_id: Optional[str] = None  
+    quantity: Optional[int] = None
+    reason: Optional[str] = None  
     max_price_try: Optional[float] = None
+    idempotency_key: Optional[str] = None
+    source_message_id: Optional[str] = None
 
 
 class APIResponse(BaseModel):

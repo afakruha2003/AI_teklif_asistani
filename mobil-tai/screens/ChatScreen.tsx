@@ -23,23 +23,23 @@ const uid = () => `msg_${++msgCounter}_${Date.now()}`;
 
 const SIMULATION_CUSTOMERS = [
   {
-    id: "CUST-IST-001",
-    name: "Mavi Kırmızı Market A.Ş.",
-    city: "İstanbul",
-    ruleInfo: "Stok Katı Kural (allow_backorder: false)"
+    id: 'CUST-IST-001',
+    name: 'Mavi Kırmızı Market A.Ş.',
+    city: 'İstanbul',
+    ruleInfo: 'Stok Katı Kural (allow_backorder: false)',
   },
   {
-    id: "CUST-ANK-002",
-    name: "Ankara Toptan Depo Ltd.",
-    city: "Ankara",
-    ruleInfo: "Beklemeli Sipariş Serbest (allow_backorder: true)"
+    id: 'CUST-ANK-002',
+    name: 'Ankara Toptan Depo Ltd.',
+    city: 'Ankara',
+    ruleInfo: 'Beklemeli Sipariş Serbest (allow_backorder: true)',
   },
   {
-    id: "CUST-IZM-003",
-    name: "İzmir Fresh Gıda",
-    city: "İzmir",
-    ruleInfo: "Standart Fiyatlandırma (allow_backorder: false)"
-  }
+    id: 'CUST-IZM-003',
+    name: 'İzmir Fresh Gıda',
+    city: 'İzmir',
+    ruleInfo: 'Standart Fiyatlandırma (allow_backorder: false)',
+  },
 ];
 
 const QUICK_QUESTIONS = [
@@ -59,6 +59,7 @@ export default function ChatScreen() {
     isStreaming,
     customerId,
     quoteId,
+    sessionId,
     addMessage,
     updateLastMessage,
     setStreaming,
@@ -81,17 +82,17 @@ export default function ChatScreen() {
     }
   }, [messages.length]);
 
-const sendMessage = useCallback(
+  const sendMessage = useCallback(
     async (text?: string) => {
       const question = (text ?? input).trim();
       if (!question || isStreaming) return;
 
       setInput('');
 
-      // State kilitlenmesini çözmek için store'un güncel anlık durumlarını doğrudan çekiyoruz:
       const currentStore = useChatStore.getState();
       const currentCustomerId = currentStore.customerId;
       const currentQuoteId = currentStore.quoteId;
+      const currentSessionId = currentStore.sessionId;
 
       addMessage({
         id: uid(),
@@ -113,90 +114,135 @@ const sendMessage = useCallback(
 
       setStreaming(true);
 
-      // streamChat'e anlık ve taze ID değerlerini parametre olarak paslıyoruz:
-      abortRef.current = streamChat(question, currentCustomerId, currentQuoteId, {
-        onSessionStart: (sessionId: string, newQuoteId?: string) => {
-          setSessionId(sessionId);
-          // Store'daki güncel taze quoteId'yi tekrar kontrol et
-          const freshQuoteId = useChatStore.getState().quoteId;
-          if (newQuoteId && !freshQuoteId) {
-            setQuoteId(newQuoteId);
-            fetchQuote(newQuoteId);
-          }
-        },
+      abortRef.current = streamChat(
+        question,
+        currentCustomerId,
+        currentQuoteId,
+        currentSessionId,
+        {
+          onSessionStart: (newSessionId: string, newQuoteId?: string) => {
+            setSessionId(newSessionId);
 
-        onToolStart: (tool, inputSummary, sequence) => {
-          updateLastMessage((msg: Message) => {
-            const newTool: ToolCallEvent = {
-              tool,
-              input_summary: inputSummary,
-              sequence,
-              status: 'running',
-            };
-            return {
-              ...msg,
-              toolCalls: [...(msg.toolCalls ?? []), newTool],
-            };
-          });
-        },
+            const freshQuoteId = useChatStore.getState().quoteId;
+            const normalizedNewQuoteId =
+              newQuoteId && newQuoteId !== 'null' && newQuoteId !== 'None'
+                ? newQuoteId
+                : null;
 
-        onToolResult: (tool, status, sequence, quoteDelta) => {
-          updateLastMessage((msg: Message) => {
-            const toolCalls = (msg.toolCalls ?? []).map((tc) =>
-              tc.sequence === sequence
-                ? { ...tc, status, quote_delta: quoteDelta }
-                : tc,
-            );
-            return { ...msg, toolCalls };
-          });
-
-          // FIX: closure'a düşmemek için store'dan en güncel quoteId'yi çekiyoruz
-          const activeQuoteId = useChatStore.getState().quoteId || quoteDelta?.quote_id;
-          
-          if (activeQuoteId) {
-            if (quoteDelta?.quote_id && useChatStore.getState().quoteId !== quoteDelta.quote_id) {
-              setQuoteId(quoteDelta.quote_id);
+            if (
+              normalizedNewQuoteId &&
+              (!freshQuoteId ||
+                freshQuoteId === 'null' ||
+                freshQuoteId === 'None')
+            ) {
+              setQuoteId(normalizedNewQuoteId);
+              fetchQuote(normalizedNewQuoteId);
             }
-            fetchQuote(activeQuoteId);
-          }
-        },
+          },
 
-        onSources: (sources: Source[]) => {
-          updateLastMessage((msg: Message) => ({ ...msg, sources }));
-        },
+          onToolStart: (tool, inputSummary, sequence) => {
+            updateLastMessage((msg: Message) => {
+              const newTool: ToolCallEvent = {
+                tool,
+                input_summary: inputSummary,
+                sequence,
+                status: 'running',
+              };
+              return {
+                ...msg,
+                toolCalls: [...(msg.toolCalls ?? []), newTool],
+              };
+            });
+          },
 
-        onTextChunk: (chunk) => {
-          updateLastMessage((msg: Message) => ({
-            ...msg,
-            content: msg.content + chunk,
-            isStreaming: true,
-          }));
-        },
+          onToolResult: (tool, status, sequence, quoteDelta) => {
+            updateLastMessage((msg: Message) => {
+              const toolCalls = (msg.toolCalls ?? []).map((tc) =>
+                tc.sequence === sequence
+                  ? { ...tc, status, quote_delta: quoteDelta }
+                  : tc,
+              );
+              return { ...msg, toolCalls };
+            });
 
-        onDone: () => {
-          updateLastMessage((msg: Message) => ({ ...msg, isStreaming: false }));
-          setStreaming(false);
-          abortRef.current = null;
-          
-          // Akış başarıyla tamamlandığında güncel teklifi bir kez daha tazeleyelim
-          const finalQuoteId = useChatStore.getState().quoteId;
-          if (finalQuoteId) {
-            fetchQuote(finalQuoteId);
-          }
-        },
+            const incomingQuoteId = quoteDelta?.quote_id;
+            const currentActiveQuoteId = useChatStore.getState().quoteId;
 
-        onError: (error) => {
-          updateLastMessage((msg: Message) => ({
-            ...msg,
-            content: msg.content || `⚠️ Hata oluştu: ${error}`,
-            isStreaming: false,
-          }));
-          setStreaming(false);
-          abortRef.current = null;
+            if (
+              incomingQuoteId &&
+              incomingQuoteId !== 'null' &&
+              incomingQuoteId !== 'None'
+            ) {
+              if (
+                !currentActiveQuoteId ||
+                currentActiveQuoteId === 'null' ||
+                currentActiveQuoteId === 'None' ||
+                currentActiveQuoteId !== incomingQuoteId
+              ) {
+                setQuoteId(incomingQuoteId);
+              }
+              fetchQuote(incomingQuoteId);
+            } else if (
+              currentActiveQuoteId &&
+              currentActiveQuoteId !== 'null' &&
+              currentActiveQuoteId !== 'None'
+            ) {
+              fetchQuote(currentActiveQuoteId);
+            }
+          },
+
+          onSources: (sources: Source[]) => {
+            updateLastMessage((msg: Message) => ({ ...msg, sources }));
+          },
+
+          onTextChunk: (chunk) => {
+            updateLastMessage((msg: Message) => ({
+              ...msg,
+              content: msg.content + chunk,
+              isStreaming: true,
+            }));
+          },
+
+          onDone: () => {
+            updateLastMessage((msg: Message) => ({
+              ...msg,
+              isStreaming: false,
+            }));
+            setStreaming(false);
+            abortRef.current = null;
+
+            const finalQuoteId = useChatStore.getState().quoteId;
+            if (
+              finalQuoteId &&
+              finalQuoteId !== 'null' &&
+              finalQuoteId !== 'None'
+            ) {
+              fetchQuote(finalQuoteId);
+            }
+          },
+
+          onError: (error) => {
+            updateLastMessage((msg: Message) => ({
+              ...msg,
+              content: msg.content || `Hata oluştu: ${error}`,
+              isStreaming: false,
+            }));
+            setStreaming(false);
+            abortRef.current = null;
+          },
         },
-      });
+      );
     },
-    [input, isStreaming, addMessage, setStreaming, setSessionId, updateLastMessage, fetchQuote, setQuoteId]
+    [
+      input,
+      isStreaming,
+      addMessage,
+      setStreaming,
+      setSessionId,
+      updateLastMessage,
+      fetchQuote,
+      setQuoteId,
+    ],
   );
 
   const cancelStream = () => {
@@ -209,7 +255,9 @@ const sendMessage = useCallback(
     <ChatBubble message={item} />
   );
 
-  const currentCustomer = SIMULATION_CUSTOMERS.find(c => c.id === customerId) || SIMULATION_CUSTOMERS[0];
+  const currentCustomer =
+    SIMULATION_CUSTOMERS.find((c) => c.id === customerId) ||
+    SIMULATION_CUSTOMERS[0];
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -218,11 +266,12 @@ const sendMessage = useCallback(
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
       >
-        {/* Header */}
         <View style={styles.header}>
           <View>
             <Text style={styles.headerTitle}>TAI Asistan</Text>
-            <Text style={styles.headerSub}>{currentCustomer.name} ({currentCustomer.city})</Text>
+            <Text style={styles.headerSub}>
+              {currentCustomer.name} ({currentCustomer.city})
+            </Text>
           </View>
           {isStreaming && (
             <TouchableOpacity style={styles.cancelBtn} onPress={cancelStream}>
@@ -231,22 +280,40 @@ const sendMessage = useCallback(
           )}
         </View>
 
-        {/* Müşteri Simülasyon Seçici */}
         {messages.length === 0 && (
           <View style={styles.selectorBar}>
-            <Text style={styles.selectorTitle}>Test Etmek İstediğiniz Müşteriyi Seçin:</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.customerScroll}>
+            <Text style={styles.selectorTitle}>
+              Test Etmek İstediğiniz Müşteriyi Seçin:
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.customerScroll}
+            >
               {SIMULATION_CUSTOMERS.map((c) => (
                 <TouchableOpacity
                   key={c.id}
-                  style={[styles.customerBtn, customerId === c.id && styles.activeBtn]}
+                  style={[
+                    styles.customerBtn,
+                    customerId === c.id && styles.activeBtn,
+                  ]}
                   onPress={() => setCustomerId && setCustomerId(c.id)}
                   activeOpacity={0.8}
                 >
-                  <Text style={[styles.customerBtnText, customerId === c.id && styles.activeText]}>
+                  <Text
+                    style={[
+                      styles.customerBtnText,
+                      customerId === c.id && styles.activeText,
+                    ]}
+                  >
                     {c.name}
                   </Text>
-                  <Text style={[styles.customerBtnSub, customerId === c.id && styles.activeSubText]}>
+                  <Text
+                    style={[
+                      styles.customerBtnSub,
+                      customerId === c.id && styles.activeSubText,
+                    ]}
+                  >
                     {c.ruleInfo}
                   </Text>
                 </TouchableOpacity>
@@ -255,13 +322,13 @@ const sendMessage = useCallback(
           </View>
         )}
 
-        {/* Messages */}
         {messages.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyIcon}>🤖</Text>
             <Text style={styles.emptyTitle}>Merhaba!</Text>
             <Text style={styles.emptyDesc}>
-              Seçili müşterinin kurallarına göre ürün, stok, fiyat ve teklif yönetimi yapabilirsiniz.
+              Seçili müşterinin kurallarına göre ürün, stok, fiyat ve teklif
+              yönetimi yapabilirsiniz.
             </Text>
             <View style={styles.quickList}>
               {QUICK_QUESTIONS.map((q) => (
@@ -287,7 +354,6 @@ const sendMessage = useCallback(
           />
         )}
 
-        {/* Input bar */}
         <View style={styles.inputBar}>
           <TextInput
             style={styles.input}
@@ -301,7 +367,10 @@ const sendMessage = useCallback(
             editable={!isStreaming}
           />
           <TouchableOpacity
-            style={[styles.sendBtn, (isStreaming || !input.trim()) && styles.sendBtnDisabled]}
+            style={[
+              styles.sendBtn,
+              (isStreaming || !input.trim()) && styles.sendBtnDisabled,
+            ]}
             onPress={() => sendMessage()}
             disabled={isStreaming || !input.trim()}
             activeOpacity={0.8}

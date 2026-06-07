@@ -4,10 +4,10 @@ import { Colors, Spacing, Radius, Typography } from '../utils/theme';
 import { ToolCallEvent } from '../types';
 
 const TOOL_LABELS: Record<string, string> = {
-  search_products: ' Ürün Arama',
-  get_knowledge_entries: ' Bilgi Tabanı',
-  get_quote: ' Teklif Okuma',
-  add_to_quote: 'Teklife Ekle',
+  search_products: '🔍 Ürün Arama',
+  get_knowledge_entries: '📖 Bilgi Tabanı',
+  get_quote: '📋 Teklif Okuma',
+  add_to_quote: '➕ Teklife Ekle',
   update_quote_item: '✏️ Miktar Güncelle',
   replace_with_alternative: '🔄 Alternatif ile Değiştir',
 };
@@ -43,32 +43,55 @@ export const ToolCallBadge: React.FC<Props> = ({ toolCall }) => {
         </Text>
       ) : null}
 
-      {toolCall.quote_delta && (
+      {toolCall.quote_delta ? (
         <QuoteDeltaBadge delta={toolCall.quote_delta} />
-      )}
+      ) : null}
     </View>
   );
 };
 
-const QuoteDeltaBadge: React.FC<{ delta: ToolCallEvent['quote_delta'] }> = ({
+const QuoteDeltaBadge: React.FC<{ delta: NonNullable<ToolCallEvent['quote_delta']> }> = ({
   delta,
 }) => {
-  if (!delta) return null;
+  
   const actionLabel =
     delta.action === 'add'
-      ? ' Eklendi'
-      : delta.action === 'update'
-      ? ' Güncellendi'
-      : ' Değiştirildi';
+      ? '📥 Eklendi'
+      : delta.action === 'update' || delta.action === 'quantity_updated'
+      ? '✏️ Güncellendi'
+      : delta.action === 'item_removed'
+      ? '🗑️ Kaldırıldı'
+      : '🔄 Değiştirildi';
+
+  const rawPrice =
+    delta.unit_price != null
+      ? delta.unit_price
+      : (delta as any).unit_price_try != null
+      ? (delta as any).unit_price_try
+      : null;
+
+  const displayPrice =
+    rawPrice != null ? Number(rawPrice).toLocaleString('tr-TR') : '—';
+
+  // Miktar: add'de "quantity", update'de "new_quantity" olabilir
+  const displayQty =
+    delta.quantity != null
+      ? delta.quantity
+      : delta.new_quantity != null
+      ? delta.new_quantity
+      : '?';
 
   return (
     <View style={styles.deltaBadge}>
       <Text style={styles.deltaAction}>{actionLabel}</Text>
-      <Text style={styles.deltaName} numberOfLines={1}>
-        {delta.product_name}
-      </Text>
+      {delta.product_name ? (
+        <Text style={styles.deltaName} numberOfLines={1}>
+          {delta.product_name}
+        </Text>
+      ) : null}
       <Text style={styles.deltaDetail}>
-        {delta.quantity} adet · {delta.unit_price.toLocaleString('tr-TR')} ₺
+        {displayQty} adet
+        {rawPrice != null ? ` · ${displayPrice} ₺` : ''}
       </Text>
     </View>
   );

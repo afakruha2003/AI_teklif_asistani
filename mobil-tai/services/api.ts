@@ -1,6 +1,6 @@
-import { Quote, Product, KnowledgeEntry } from '../types';
+import { Quote, Product, KnowledgeEntry, QuoteItem } from '../types';
 
-const LOCAL_IP_URL = 'http://localhost:8000/api/v1'; 
+const LOCAL_IP_URL = 'http://localhost:8000/api/v1';
 
 export const API_BASE_URL = (
   process.env.EXPO_PUBLIC_API_URL ?? LOCAL_IP_URL
@@ -21,10 +21,37 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+function normalizeQuoteItem(raw: any): QuoteItem {
+  const resolvedId: string = raw.id ?? raw.item_id ?? '';
+  return {
+    ...raw,
+    id: resolvedId,
+    item_id: resolvedId,
+    unit_price_try: raw.unit_price_try ?? raw.unit_price ?? 0,
+    line_total_try:
+      raw.line_total_try ??
+      (raw.unit_price_try ?? raw.unit_price ?? 0) * (raw.quantity ?? 0),
+    discount_pct: raw.discount_pct ?? 0,
+  };
+}
+
+function normalizeQuote(raw: any): Quote {
+  return {
+    ...raw,
+    id: raw.id ?? raw.quote_id ?? '',
+    items: Array.isArray(raw.items) ? raw.items.map(normalizeQuoteItem) : [],
+  };
+}
+
 export const quoteApi = {
-  
-  get: (quoteId: string) => apiFetch<Quote>(`/quotes/${quoteId}/`),
-  list: () => apiFetch<Quote[]>('/quotes/'),
+  get: async (quoteId: string): Promise<Quote> => {
+    const raw = await apiFetch<any>(`/quotes/${quoteId}`);
+    return normalizeQuote(raw);
+  },
+  list: async (): Promise<Quote[]> => {
+    const raw = await apiFetch<any[]>('/quotes/');
+    return raw.map(normalizeQuote);
+  },
 };
 
 export const productApi = {
@@ -41,8 +68,6 @@ export const knowledgeApi = {
 };
 
 export interface ChatStreamCallbacks {
-  // FIX: quoteId parametresi eklendi — session_start event'inden backend
-  // yeni oluşturulan quote_id'yi döndürüyor, bunu ChatScreen'e iletiyoruz.
   onSessionStart?: (sessionId: string, quoteId?: string) => void;
   onToolStart?: (tool: string, inputSummary: string, sequence: number) => void;
   onToolResult?: (
@@ -61,6 +86,7 @@ export function streamChat(
   question: string,
   customerId: string,
   quoteId: string | null,
+  sessionId: string | null,
   callbacks: ChatStreamCallbacks,
 ): AbortController {
   const ctrl = new AbortController();
@@ -106,8 +132,8 @@ export function streamChat(
         const payload = JSON.parse(dataStr);
         const type: string = payload.type || eventName || '';
         handleSSEEvent(type, payload, callbacks);
-      } catch {
-        // Yarım JSON — bir sonraki onprogress'te tamamlanır
+      } catch (_e) {
+        // Yarım JSON chunk — bir sonraki onprogress'te tamamlanacak
       }
     }
   };
@@ -127,8 +153,19 @@ export function streamChat(
 
   ctrl.signal.addEventListener('abort', () => xhr.abort());
 
+  // SCN-010: idempotency_key her mesaj için benzersiz üretiliyor
+  const idempotencyKey = sessionId
+    ? `${sessionId}_${Date.now()}`
+    : `anon_${Date.now()}`;
+
   xhr.send(
-    JSON.stringify({ message: question, customer_id: customerId, quote_id: quoteId }),
+    JSON.stringify({
+      message: question,
+      customer_id: customerId,
+      quote_id: quoteId,
+      session_id: sessionId,
+      idempotency_key: idempotencyKey,
+    }),
   );
 
   return ctrl;
@@ -139,9 +176,6 @@ function handleSSEEvent(type: string, event: any, cb: ChatStreamCallbacks) {
     case 'session_start':
     case 'message_start':
       if (event.session_id) {
-        // FIX: event.quote_id artık doğru şekilde iletiliyor.
-        // Backend handle_chat_stream'de session_start event'i her zaman
-        // quote_id içeriyor — yeni oluşturulmuş ya da mevcut.
         cb.onSessionStart?.(event.session_id, event.quote_id ?? undefined);
       }
       break;

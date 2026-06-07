@@ -1,50 +1,110 @@
-# Welcome to your Expo app 👋
+# mobil-tai
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+React Native / Expo mobile app for The Blue Red quote assistant. Provides a streaming chat interface and a shared quote view that stays in sync with the web panel.
 
-## Get started
+---
 
-1. Install dependencies
+## Setup
 
-   ```bash
-   npm install
-   ```
+```bash
+npm install
+npx expo start
+```
 
-2. Start the app
+### Environment Variables
 
-   ```bash
-   npx expo start
-   ```
+Create a `.env` file in the `mobil-tai/` directory:
 
-In the output, you'll find options to open the app in a
+```env
+EXPO_PUBLIC_API_BASE_URL=http://localhost:8000
+```
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+On a physical device, replace `localhost` with your machine's local network IP address. The device must be on the same network as the backend.
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+---
 
-## Get a fresh project
+## Running
 
-When you're ready, run:
+| Target | Command |
+|--------|---------|
+| Expo Go (scan QR) | `npx expo start` |
+| iOS Simulator | `npx expo run:ios` |
+| Android Emulator | `npx expo run:android` |
+
+iOS requires Xcode 14+ on macOS. Android requires Android Studio with Java 17.
+
+---
+
+## Project Structure
+
+```
+mobil-tai/
+├── app/
+│   ├── _layout.tsx              # Root navigator, tab bar setup
+│   ├── index.tsx                # Entry point, redirects to chat tab
+│   ├── quote.tsx                # Quote screen route
+│   ├── products.tsx             # Products screen route
+│   └── settings.tsx             # Settings screen route
+├── screens/
+│   ├── ChatScreen.tsx           # Streaming chat UI, SSE event handling
+│   ├── QuoteScreen.tsx          # Quote line items, totals, item status
+│   ├── ProductsScreen.tsx       # Product browser
+│   └── SettingsScreen.tsx       # API URL and session configuration
+├── components/
+│   ├── ChatBubble.tsx           # User and assistant message bubbles
+│   ├── StreamingDots.tsx        # Animated indicator while response streams
+│   ├── SourcesPanel.tsx         # Displays product_id / knowledge_id sources
+│   ├── ToolCallBadge.tsx        # Shows tool name and success / error status
+│   ├── QuoteItemCard.tsx        # Single quote line item card
+│   └── ui/                      # Low-level UI primitives (icon-symbol, collapsible)
+├── store/
+│   ├── chatStore.ts             # Chat message state and session ID
+│   └── quoteStore.ts            # Quote state, updated from tool_result events
+├── services/
+│   └── api.ts                   # Fetch wrappers for backend endpoints
+├── types/
+│   └── index.ts                 # Shared TypeScript types
+├── constants/
+│   └── theme.ts                 # Color tokens and spacing
+├── hooks/
+│   ├── use-color-scheme.ts
+│   └── use-theme-color.ts
+└── utils/
+    └── theme.ts
+```
+
+---
+
+## Chat Screen
+
+`screens/ChatScreen.tsx` connects to `POST /api/v1/chat/stream` and reads the SSE response. Events are handled as follows:
+
+| Event | Behavior |
+|-------|----------|
+| `session_start` | Stores `session_id`, sets mode label (llm / fallback) |
+| `tool_start` | Renders a `ToolCallBadge` with the tool name |
+| `tool_result` | Updates the badge status; if `quote_delta` is present, updates `quoteStore` |
+| `text_chunk` | Appends text to the assistant bubble; `StreamingDots` shows while streaming |
+| `sources` | Renders `SourcesPanel` below the message with product and knowledge links |
+| `done` | Marks streaming complete |
+| `error` | Shows error text in the chat |
+
+---
+
+## Quote Screen
+
+`screens/QuoteScreen.tsx` calls `GET /api/v1/quotes/{quote_id}` and renders `QuoteItemCard` for each active line item. Items with `status=replaced` or `status=removed` are not shown. The quote ID comes from `chatStore` (set when the session starts).
+
+This screen reads the same data as the web Quotes page. Both surfaces show the same state for the same `quote_id`.
+
+---
+
+## Reset
+
+To reset Expo's generated files and start from a clean `app/` directory:
 
 ```bash
 npm run reset-project
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
 
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.

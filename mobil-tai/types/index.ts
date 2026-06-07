@@ -1,5 +1,3 @@
-// ── Chat Types ──────────────────────────────────────────────────────────────
-
 export type MessageRole = 'user' | 'assistant';
 
 export interface Source {
@@ -10,11 +8,18 @@ export interface Source {
 }
 
 export interface QuoteDelta {
-  action: 'add' | 'update' | 'replace';
-  product_id: string;
-  product_name: string;
-  quantity: number;
-  unit_price: number;
+  action: 'add' | 'update' | 'replace' | 'item_removed' | 'item_replaced' | 'quantity_updated';
+  item_id?: string;
+  product_id?: string;
+  product_name?: string;
+  quantity?: number;
+  unit_price?: number;
+  unit_price_try?: number;
+  quote_id?: string;
+  old_item_id?: string;
+  new_item_id?: string;
+  old_quantity?: number;
+  new_quantity?: number;
 }
 
 export interface ToolCallEvent {
@@ -36,35 +41,33 @@ export interface Message {
   timestamp: Date;
 }
 
-// ── Quote Types ──────────────────────────────────────────────────────────────
-
-export type QuoteItemStatus = 'active' | 'replaced' | 'passive';
+export type QuoteItemStatus = 'active' | 'replaced' | 'passive' | 'removed';
 
 export interface QuoteItem {
   id: string;
+  item_id?: string;
   product_id: string;
   product_name: string;
-  sku: string;
+  sku?: string;
   quantity: number;
-  unit_price: number;
-  total_price: number;
+  unit_price_try: number;
+  line_total_try: number;
+  discount_pct: number;
   status: QuoteItemStatus;
-  discount?: number;
+  is_backorder?: boolean;
 }
 
 export interface Quote {
   id: string;
   customer_id: string;
-  customer_name: string;
+  customer_name?: string;
   status: string;
   items: QuoteItem[];
-  total: number;
-  currency: string;
-  created_at: string;
-  updated_at: string;
+  total_try: number;
+  currency?: string;
+  created_at?: string;
+  updated_at?: string;
 }
-
-// ── Product Types ────────────────────────────────────────────────────────────
 
 export interface Product {
   id: string;
@@ -78,8 +81,6 @@ export interface Product {
   tags?: string[];
 }
 
-// ── Knowledge Types ──────────────────────────────────────────────────────────
-
 export interface KnowledgeEntry {
   id: string;
   title: string;
@@ -88,9 +89,8 @@ export interface KnowledgeEntry {
   tags?: string[];
 }
 
-// ── SSE Event Types ──────────────────────────────────────────────────────────
-
 export type SSEEventType =
+  | 'session_start'
   | 'message_start'
   | 'tool_start'
   | 'tool_result'
@@ -111,8 +111,6 @@ export interface SSEEvent {
   text?: string;
   error?: string;
 }
-
-// ── Store Types ───────────────────────────────────────────────────────────────
 
 export interface ChatStore {
   messages: Message[];

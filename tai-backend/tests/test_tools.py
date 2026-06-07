@@ -373,12 +373,20 @@ async def test_fallback_retrieval_returns_knowledge_sources(
 
 
 @pytest.mark.asyncio
-async def test_fallback_does_not_call_llm(db: AsyncSession, monkeypatch):
-    """LLM_ENABLED=False olduğunda LLM çağrısı yapılmamalı."""
-    from app.core import config
-    monkeypatch.setattr(config.settings, "OPENAI_API_KEY", None)
-    assert config.settings.llm_enabled is False
+async def test_fallback_does_not_call_llm():
+    from app.core.config import Settings
 
+    settings_off = Settings(LLM_ENABLED=False, OPENAI_API_KEY="sk-...", GEMINI_API_KEY="AIza...")
+    assert settings_off.llm_enabled is False
+
+    settings_no_keys = Settings(LLM_ENABLED=True, OPENAI_API_KEY=None, GEMINI_API_KEY="")
+    assert settings_no_keys.llm_enabled is False
+
+    settings_only_openai = Settings(LLM_ENABLED=True, OPENAI_API_KEY="sk-123", GEMINI_API_KEY=None)
+    assert settings_only_openai.llm_enabled is True
+
+    settings_only_gemini = Settings(LLM_ENABLED=True, OPENAI_API_KEY=None, GEMINI_API_KEY="AIza987")
+    assert settings_only_gemini.llm_enabled is True
 
 @pytest.mark.asyncio
 async def test_quote_state_consistent_across_reads(db: AsyncSession, quote: Quote, product_in_stock: Product):

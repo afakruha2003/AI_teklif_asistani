@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import AsyncGenerator
+import logging
+import re
+from typing import AsyncGenerator, Dict, Any, Optional, List
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,23 +21,25 @@ from app.tools.tool_implementations import (
     add_to_quote, update_quote_item, replace_with_alternative,
 )
 
+logger = logging.getLogger(__name__)
 
 OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "Searches items matching criteria like query strings, categories, maximum price limits, stock status, and system tags.",
+            "description": "Searches items matching criteria. If user asks by category, use category name as query. NEVER pass empty string as query.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search keyword or alias"},
-                    "category": {"type": "string", "description": "Filter by product category"},
+                    "query": {"type": "string", "description": "Search keyword. MUST NOT be empty. Use category name if no keyword."},
+                    "category": {"type": "string", "description": "Filter by product category (optional)"},
                     "max_price_try": {"type": "number", "description": "Upper pricing limit in TRY"},
                     "in_stock_only": {"type": "boolean", "default": True},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "limit": {"type": "integer", "default": 10},
                 },
+                "required": ["query"],
             },
         },
     },
@@ -47,11 +51,12 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "category": {"type": "string"},
+                    "query": {"type": "string", "description": "Search query. MUST NOT be empty."},
+                    "category": {"type": "string", "description": "Filter by category (optional)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "limit": {"type": "integer", "default": 5},
                 },
+                "required": ["query"],
             },
         },
     },
@@ -63,7 +68,7 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string"},
+                    "quote_id": {"type": "string", "description": "The exact ID of the active target quote draft. NEVER invent a new UUID here."},
                 },
                 "required": ["quote_id"],
             },
@@ -77,9 +82,9 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string"},
+                    "quote_id": {"type": "string", "description": "The exact ID of the active target quote draft. NEVER invent a new UUID here."},
                     "product_id": {"type": "string"},
-                    "quantity": {"type": "integer", "default": 1},
+                    "quantity": {"type": "integer", "description": "Exact item quantity requested by user. Default is 1.", "default": 1},
                     "idempotency_key": {"type": "string"},
                     "max_price_try": {"type": "number"},
                     "allow_backorder": {"type": "boolean", "default": False},
@@ -96,7 +101,7 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string"},
+                    "quote_id": {"type": "string", "description": "The exact ID of the active target quote draft. NEVER invent a new UUID here."},
                     "item_id": {"type": "string"},
                     "quantity": {"type": "integer"},
                 },
@@ -112,7 +117,7 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string"},
+                    "quote_id": {"type": "string", "description": "The exact ID of the active target quote draft. NEVER invent a new UUID here."},
                     "item_id": {"type": "string"},
                     "alternative_product_id": {"type": "string"},
                     "max_price_try": {"type": "number"},
@@ -127,17 +132,125 @@ BASE_SYSTEM_PROMPT = """You are the enterprise sales engine for The Blue Red cor
 The catalog includes barcode scanners, industrial hand terminals, thermal printers, corporate software licenses, and integration services.
 Primary objectives involve answering requests accurately, recommending products, and maintaining quote draft parameters.
 
+CRITICAL GROQ COMPATIBILITY RULES:
+1. NEVER pass empty strings as parameter values. If a parameter is optional and you don't have a value, OMIT it entirely.
+2. For search_products, ALWAYS provide a non-empty 'query' string. If user asks by category, use category name as query.
+3. Example: User asks "500 TL altı el terminali öner" -> search_products(query="el terminali", max_price_try=500)
+4. Do NOT use query="" (empty string) - this will cause an API error.
+
 Operational Compliance Rules:
 - Absolute Price Caps: If a maximum price limit is active, do not suggest or add products above it.
-- Default Stock Rule: Do not recommend out-of-stock items (stock=0) unless explicitly instructed or backorder is allowed.
-- Citation Enforcement: Append the respective 'knowledge_id' string whenever corporate guidelines are cited.
-- Aggregation Rule: Never duplicate item slots for the same product; increase lines additively.
-- Language Constraint: All public client communication must be executed in Turkish."""
+- Default Stock Rule: Do not recommend out-of-stock items (stock=0) unless user explicitly accepts wait.
+- Citation Enforcement: MUST call get_knowledge_entries before answering policy questions.
+- Aggregation Rule: Never duplicate item slots; increase quantity additively.
+- Language Constraint: All responses must be in Turkish.
+- Exact Product Match: Add ONLY the exact product requested. Do not add Plus variants unless explicitly requested.
 
+CRITICAL RESPONSE RULES:
+- After calling search_products, examine the actual products returned.
+- If products found, list them with prices.
+- If no products found within price limit, suggest increasing budget or show alternatives.
+- Always check if search_products result has 'suggestions' key. If yes, use it to recommend alternatives.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
+CONVERSATION CONTEXT:
+- Remember previous user questions and answers.
+- If user asks for alternatives after a specific product, suggest from SAME category.
+- Keep track of the last mentioned product category.
+
+CRITICAL CATEGORY SEARCH RULES:
+- "el terminali" -> ONLY search in pos_terminal category
+- "barkod okuyucu" -> ONLY search in barcode_scanner category
+- "yazıcı" -> search in label_printer and receipt_printer categories
+- "yazılım" -> ONLY search in software category
+- Do NOT mix categories unless user explicitly asks for alternatives.
+"""
+
+def _clean_tool_arguments(tool_calls_list: List[Any]) -> List[Any]:
+    for tc in tool_calls_list:
+        if not tc.function.arguments:
+            continue
+            
+        try:
+            args = json.loads(tc.function.arguments)
+            if not isinstance(args, dict):
+                continue
+                
+            cleaned = {}
+            for k, v in args.items():
+                if v == "" or v is None:
+                    continue
+                cleaned[k] = v
+            
+            if tc.function.name == "search_products":
+                if "query" not in cleaned or cleaned.get("query") == "":
+                    if "category" in cleaned and cleaned["category"]:
+                        cleaned["query"] = cleaned["category"]
+                    else:
+                        cleaned["query"] = "urun"
+                if "max_price_try" in cleaned and cleaned["max_price_try"] is None:
+                    del cleaned["max_price_try"]
+                if "limit" in cleaned and cleaned["limit"] is None:
+                    del cleaned["limit"]
+            
+            if tc.function.name == "get_knowledge_entries":
+                if "query" not in cleaned or cleaned.get("query") == "":
+                    cleaned["query"] = "bilgi"
+                if "limit" in cleaned and cleaned["limit"] is None:
+                    del cleaned["limit"]
+            
+            if tc.function.name == "add_to_quote":
+                if "quantity" not in cleaned or cleaned.get("quantity") is None:
+                    cleaned["quantity"] = 1
+                if "max_price_try" in cleaned and cleaned["max_price_try"] is None:
+                    del cleaned["max_price_try"]
+            
+            tc.function.arguments = json.dumps(cleaned, ensure_ascii=False)
+            
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+            logger.debug(f"Error cleaning arguments for {tc.function.name}: {e}")
+            continue
+    
+    return tool_calls_list
+
+def _parse_turkish_number(text: str) -> float | None:
+    _ONES = {
+        "sifir": 0, "bir": 1, "iki": 2, "uc": 3, "dort": 4, "bes": 5,
+        "alti": 6, "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10,
+        "onbir": 11, "oniki": 12, "onuc": 13, "ondort": 14, "onbes": 15,
+        "onalti": 16, "onyedi": 17, "onsekiz": 18, "ondokuz": 19,
+        "yirmi": 20, "otuz": 30, "kirk": 40, "elli": 50,
+        "altmis": 60, "yetmis": 70, "seksen": 80, "doksan": 90,
+    }
+    _MAGNITUDE = {"yuz": 100, "bin": 1000, "milyon": 1000000}
+    _CURRENCY = {"tl", "try", "lira"}
+
+    tokens = text.lower().split()
+    if not any(t.strip("?!,") in _CURRENCY for t in tokens):
+        return None
+
+    cur_idx = next((i for i, t in enumerate(tokens) if t.strip("?!,") in _CURRENCY), -1)
+    if cur_idx == -1:
+        return None
+
+    num_tokens = tokens[max(0, cur_idx - 6):cur_idx]
+    total = 0.0
+    current = 0.0
+
+    for t in num_tokens:
+        t = t.strip("?!,")
+        if t in ("bucuk", "yarim"):
+            current += 0.5
+        elif t in _ONES:
+            current += _ONES[t]
+        elif t in _MAGNITUDE:
+            mag = _MAGNITUDE[t]
+            if current == 0:
+                current = 1
+            total += current * mag
+            current = 0.0
+
+    total += current
+    return float(total) if total > 0 else None
 
 async def dispatch_tool(
     tool_name: str,
@@ -147,7 +260,6 @@ async def dispatch_tool(
     sequence_num: int,
     request: ChatRequest,
 ) -> dict:
-    # Propagate global price cap to every relevant tool call
     if request.max_price_try is not None:
         if tool_name == "search_products" and "max_price_try" not in tool_args:
             tool_args["max_price_try"] = request.max_price_try
@@ -171,11 +283,6 @@ async def dispatch_tool(
     else:
         return {"error": f"Unknown tool reference: {tool_name}"}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM streaming path
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def stream_chat_llm(
     request: ChatRequest,
     db: AsyncSession,
@@ -184,80 +291,136 @@ async def stream_chat_llm(
     quote_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     from openai import AsyncOpenAI
+    import asyncio
+
+    logger.info(f"LLM STREAM START - Session: {session_id}, Quote: {quote_id}")
+    logger.info(f"OpenAI Config: Model={settings.OPENAI_MODEL}, BaseURL={settings.OPENAI_BASE_URL}")
+    logger.info(f"Previous messages count: {len(messages_list)}")
+
+    if not settings.OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is missing in stream_chat_llm")
+        raise ValueError("OPENAI_API_KEY is required for LLM mode")
 
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        base_url=settings.OPENAI_BASE_URL if settings.OPENAI_BASE_URL else None,
     )
 
-    # Build in-memory message history — never touch DB objects after commit
     messages: list[dict] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
 
-    for msg in messages_list[:-1]:
-        if not msg["content"]:
+    for msg in messages_list:
+        if not msg.get("content"):
             continue
-        if msg["role"] == "assistant" and msg["content"].startswith(("[", "{")):
-            try:
-                tool_calls = json.loads(msg["content"])
-                messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
-                continue
-            except json.JSONDecodeError:
-                pass
-        messages.append({"role": msg["role"], "content": msg["content"]})
+        if msg["role"] == "user":
+            messages.append({"role": "user", "content": msg["content"]})
+        elif msg["role"] == "assistant":
+            messages.append({"role": "assistant", "content": msg["content"]})
+        elif msg["role"] == "tool":
+            continue
+        else:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    logger.info(f"Loaded {len(messages)-1} previous messages into context")
+
+    def has_category_in_query(query: str) -> bool:
+        query_lower = query.lower()
+        keywords = ["el terminali", "barkod", "yazici", "yazilim", "lisans", "aksesuar", "kurulum", "scanner", "printer", "terminal", "etiket"]
+        return any(kw in query_lower for kw in keywords)
+
+    def get_last_category_from_history(msgs: list[dict]) -> Optional[str]:
+        category_map = {
+            "el terminali": "pos_terminal", "terminal": "pos_terminal", "pos": "pos_terminal",
+            "barkod": "barcode_scanner", "scanner": "barcode_scanner", "okuyucu": "barcode_scanner",
+            "yazici": "label_printer", "printer": "label_printer", "etiket": "label_printer",
+            "yazilim": "software", "lisans": "software",
+            "aksesuar": "accessory", "sarj": "accessory",
+            "kurulum": "service"
+        }
+        for msg in reversed(msgs):
+            if msg["role"] == "user":
+                content = msg["content"].lower()
+                for kw, cat in category_map.items():
+                    if kw in content:
+                        logger.info(f"Found category '{cat}' from keyword '{kw}'")
+                        return cat
+        return None
 
     user_payload = request.message
-    if request.max_price_try:
-        user_payload += f" [Price Limit Threshold: {request.max_price_try} TRY]"
     if quote_id:
-        user_payload += f" [Target Context Quote ID: {quote_id}]"
+        user_payload += f" [Quote ID: {quote_id}]"
+    if request.max_price_try:
+        user_payload += f" [Budget: {request.max_price_try} TRY]"
+
+    if not has_category_in_query(request.message):
+        last_cat = get_last_category_from_history(messages_list)
+        if last_cat:
+            cat_tr = {
+                "pos_terminal": "el terminali", "barcode_scanner": "barkod okuyucu",
+                "label_printer": "etiket yazici", "software": "yazilim",
+                "accessory": "aksesuar", "service": "kurulum"
+            }.get(last_cat, last_cat)
+            user_payload += f" [Context: {cat_tr} kategorisinde ara]"
+            logger.info(f"Added category context: {cat_tr}")
+
     messages.append({"role": "user", "content": user_payload})
+    logger.info(f"User message: {user_payload[:150]}...")
 
     sequence_num = 0
     yield f"event: session_start\ndata: {json.dumps({'session_id': session_id, 'type': 'session_start', 'quote_id': quote_id})}\n\n"
 
-    while True:
-        stream = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
-            messages=messages,
-            tools=OPENAI_TOOLS,
-            tool_choice="auto",
-            stream=True,
-        )
+    max_iterations = 10
+    iteration = 0
 
-        full_content = ""
+    while iteration < max_iterations:
+        iteration += 1
+        logger.info(f"LLM Iteration {iteration}")
+
+        try:
+            response = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,
+                tools=OPENAI_TOOLS,
+                tool_choice="auto",
+                stream=False,
+            )
+        except Exception as api_error:
+            logger.error(f"API call failed: {api_error}")
+            yield f"event: text_chunk\ndata: {json.dumps({'text': 'Uzgunum, servis su anda mesgul. Lutfen biraz sonra tekrar deneyin.', 'session_id': session_id})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'type': 'done'})}\n\n"
+            return
+
+        choice = response.choices[0]
+        finish_reason = choice.finish_reason
+        msg_obj = choice.message
+        full_content = msg_obj.content or ""
+        tool_calls_list = msg_obj.tool_calls or []
+
+        logger.info(f"Response - Finish: {finish_reason}, Content: {len(full_content)} chars, Tools: {len(tool_calls_list)}")
+
+        if tool_calls_list:
+            tool_calls_list = _clean_tool_arguments(tool_calls_list)
+
+        if full_content:
+            cleaned = re.sub(r'<function=[^>]+>', '', full_content)
+            cleaned = re.sub(r'</function>', '', cleaned)
+            cleaned = re.sub(r'\[\{"id":.*?"function":.*?\}\]', '', cleaned)
+            cleaned = re.sub(r'\\n\\n', '\n\n', cleaned)
+
+            if cleaned.strip():
+                chunk_size = 100
+                for i in range(0, len(cleaned), chunk_size):
+                    chunk = cleaned[i:i+chunk_size]
+                    yield f"event: text_chunk\ndata: {json.dumps({'text': chunk, 'session_id': session_id})}\n\n"
+                    await asyncio.sleep(0.02)
+
         tool_calls_raw: dict[str, dict] = {}
-        finish_reason = None
+        for i, tc in enumerate(tool_calls_list):
+            tool_calls_raw[str(i)] = {
+                "id": tc.id or f"call_{uuid.uuid4().hex[:8]}",
+                "name": tc.function.name or "",
+                "arguments": tc.function.arguments or "{}",
+            }
 
-        async for chunk in stream:
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-
-            finish_reason = choice.finish_reason or finish_reason
-            delta = choice.delta
-
-            if delta and delta.content:
-                full_content += delta.content
-                yield f"event: text_chunk\ndata: {json.dumps({'text': delta.content, 'session_id': session_id})}\n\n"
-
-            if delta and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = str(tc.index)
-                    if idx not in tool_calls_raw:
-                        tool_calls_raw[idx] = {
-                            "id": tc.id or "",
-                            "name": (tc.function.name or "") if tc.function else "",
-                            "arguments": "",
-                        }
-                    if tc.id:
-                        tool_calls_raw[idx]["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name:
-                            tool_calls_raw[idx]["name"] = tc.function.name
-                        if tc.function.arguments:
-                            tool_calls_raw[idx]["arguments"] += tc.function.arguments
-
-        # ── Build formatted tool-call list ────────────────────────────────
         formatted_tool_calls: list[dict] = []
         if tool_calls_raw:
             for key in sorted(tool_calls_raw.keys(), key=int):
@@ -268,39 +431,27 @@ async def stream_chat_llm(
                     "function": {"name": val["name"], "arguments": val["arguments"]},
                 })
 
-        # ── Persist assistant turn ─────────────────────────────────────────
-        # FIX: extract all primitives BEFORE commit so we never touch expired
-        # ORM objects afterwards.
         if full_content or formatted_tool_calls:
-            assistant_payload: dict = {
-                "role": "assistant",
-                "content": full_content or None,
-            }
+            assistant_payload = {"role": "assistant", "content": full_content or None}
             if formatted_tool_calls:
                 assistant_payload["tool_calls"] = formatted_tool_calls
+            messages.append(assistant_payload)
 
-            # Keep a plain-dict copy for messages history (safe post-commit)
-            messages.append(dict(assistant_payload))
-
-            persisted_content = (
-                full_content if full_content else json.dumps(formatted_tool_calls)
-            )
+            persisted = full_content if full_content else json.dumps(formatted_tool_calls, ensure_ascii=False)
             asst_msg = ChatMessage(
                 id=str(uuid.uuid4()),
                 session_id=session_id,
                 role="assistant",
-                content=persisted_content,
+                content=persisted[:1000],
             )
             db.add(asst_msg)
             await db.commit()
-            # NOTE: we do NOT access asst_msg after this point — commit is done.
 
-        # ── No tool calls → we're finished ────────────────────────────────
         if not tool_calls_raw or finish_reason == "stop":
+            logger.info("LLM completed")
             yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'type': 'done'})}\n\n"
-            break
+            return
 
-        # ── Execute tool calls ─────────────────────────────────────────────
         tool_results: list[dict] = []
         all_sources: list[dict] = []
 
@@ -313,47 +464,62 @@ async def stream_chat_llm(
             except json.JSONDecodeError:
                 tool_args = {}
 
+            if quote_id and "quote_id" in tool_args:
+                if not tool_args["quote_id"] or tool_args["quote_id"] != quote_id:
+                    tool_args["quote_id"] = quote_id
+
             sequence_num += 1
-            yield (
-                f"event: tool_start\ndata: "
-                f"{json.dumps({'tool': tool_name, 'input': tool_args, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-            )
+            yield f"event: tool_start\ndata: {json.dumps({'tool': tool_name, 'input': tool_args, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
 
-            result = await dispatch_tool(
-                tool_name, tool_args, db, session_id, sequence_num, request
-            )
+            try:
+                result = await dispatch_tool(tool_name, tool_args, db, session_id, sequence_num, request)
+                logger.info(f"Tool {tool_name} executed")
+            except Exception as tool_exc:
+                logger.error(f"Tool {tool_name} error: {tool_exc}")
+                await db.rollback()
+                result = {"error": str(tool_exc)}
 
-            # ── Extract sources before any further DB work ─────────────────
             if tool_name == "search_products":
                 for p in result.get("products", []):
                     all_sources.append({"type": "product", "id": p["id"], "name": p.get("name", "")})
+                if "suggestions" in result:
+                    for p in result["suggestions"].get("products", []):
+                        all_sources.append({"type": "product", "id": p["id"], "name": p.get("name", "")})
             elif tool_name == "get_knowledge_entries":
                 for e in result.get("knowledge_entries", []):
                     all_sources.append({"type": "knowledge", "id": e["knowledge_id"], "name": e.get("title", "")})
 
-            # ── Build quote_delta from result (primitives only) ────────────
-            quote_delta: dict | None = result.get("quote_delta") or (
+            quote_delta = result.get("quote_delta") or (
                 {k: v for k, v in result.items() if k in ("action", "item_id", "product_id", "new_quantity")}
-                if result.get("success")
-                else None
+                if result.get("success") else None
             )
 
-            yield (
-                f"event: tool_result\ndata: "
-                f"{json.dumps({'tool': tool_name, 'success': 'error' not in result, 'quote_delta': quote_delta, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-            )
+            tool_result_data = {
+                'tool': tool_name,
+                'success': 'error' not in result,
+                'quote_delta': quote_delta,
+                'sequence': sequence_num,
+                'session_id': session_id
+            }
 
-            # ── Persist tool result as a chat message ──────────────────────
-            # FIX: tool results were not persisted in the original code.
+            if tool_name == "search_products":
+                if "suggestions" in result:
+                    tool_result_data["suggestions"] = result["suggestions"]
+                if "products" in result:
+                    tool_result_data["product_count"] = len(result["products"])
+                if "detected_category" in result:
+                    tool_result_data["detected_category"] = result["detected_category"]
+
+            yield f"event: tool_result\ndata: {json.dumps(tool_result_data)}\n\n"
+
             tool_msg = ChatMessage(
                 id=str(uuid.uuid4()),
                 session_id=session_id,
                 role="tool",
-                content=json.dumps(result, ensure_ascii=False, default=str),
+                content=json.dumps(result, ensure_ascii=False, default=str)[:2000],
             )
             db.add(tool_msg)
             await db.commit()
-            # Do NOT read tool_msg attributes after commit.
 
             tool_results.append({
                 "role": "tool",
@@ -361,125 +527,52 @@ async def stream_chat_llm(
                 "content": json.dumps(result, ensure_ascii=False, default=str),
             })
 
-        # Emit aggregated sources event after all tools in this round
         if all_sources:
-            yield (
-                f"event: sources\ndata: "
-                f"{json.dumps({'sources': all_sources, 'session_id': session_id})}\n\n"
-            )
+            unique_sources = []
+            seen_ids = set()
+            for s in all_sources:
+                if s["id"] not in seen_ids:
+                    seen_ids.add(s["id"])
+                    unique_sources.append(s)
+            yield f"event: sources\ndata: {json.dumps({'sources': unique_sources, 'session_id': session_id})}\n\n"
 
-        # Extend in-memory messages with tool results for next LLM turn
         messages.extend(tool_results)
+        await asyncio.sleep(0.1)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fallback (no-LLM) streaming path
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_turkish_number(text: str) -> float | None:
-    """
-    "onbir bin tl", "beş yüz lira", "iki buçuk bin try" gibi Türkçe
-    yazılı sayıları float TRY değerine çevirir.
-    Önce sayı kelimelerini rakama çevirir, ardından para birimi arar.
-    Sonuç yoksa None döner.
-    """
-    _ONES = {
-        "sıfır": 0, "bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5,
-        "altı": 6, "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10,
-        "onbir": 11, "oniki": 12, "onüç": 13, "ondört": 14, "onbeş": 15,
-        "onaltı": 16, "onyedi": 17, "onsekiz": 18, "ondokuz": 19,
-        "yirmi": 20, "otuz": 30, "kırk": 40, "elli": 50,
-        "altmış": 60, "yetmiş": 70, "seksen": 80, "doksan": 90,
-    }
-    _MAGNITUDE = {"yüz": 100, "bin": 1000, "milyon": 1_000_000}
-    _CURRENCY = {"tl", "try", "lira", "₺"}
-
-    tokens = text.lower().split()
-
-    if not any(t.strip("?.!,") in _CURRENCY for t in tokens):
-        return None
-
-    cur_idx = next(
-        (i for i, t in enumerate(tokens) if t.strip("?.!,") in _CURRENCY), -1
-    )
-    if cur_idx == -1:
-        return None
-
-    num_tokens = tokens[max(0, cur_idx - 6): cur_idx]
-
-    total = 0.0
-    current = 0.0
-
-    for t in num_tokens:
-        t = t.strip("?.!,")
-        if t in ("buçuk", "bucuk", "yarım"):
-            # "buçuk" adds 0.5 to current BEFORE magnitude so that
-            # "iki buçuk bin" → current=2.5 → *1000 = 2500
-            current += 0.5
-        elif t in _ONES:
-            current += _ONES[t]
-        elif t in _MAGNITUDE:
-            mag = _MAGNITUDE[t]
-            if current == 0:
-                current = 1
-            total += current * mag
-            current = 0.0
-
-    total += current
-    return float(total) if total > 0 else None
-
+    logger.warning(f"Max iterations ({max_iterations}) reached")
+    yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'type': 'done', 'warning': 'max_iterations_reached'})}\n\n"
 
 async def stream_chat_fallback(
     request: ChatRequest,
     db: AsyncSession,
     session_id: str,
+    quote_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    import re
-
     sequence_num = 0
-    yield (
-        f"event: session_start\ndata: "
-        f"{json.dumps({'session_id': session_id, 'type': 'session_start', 'mode': 'fallback'})}\n\n"
-    )
+    logger.warning(f"FALLBACK MODE ACTIVE - Session: {session_id}")
 
+    yield f"event: session_start\ndata: {json.dumps({'session_id': session_id, 'type': 'session_start', 'quote_id': quote_id, 'mode': 'fallback'})}\n\n"
+
+    active_quote_id = quote_id or request.quote_id
     normalized_msg = request.message.lower()
     response_parts: list[str] = []
     source_ids: list[str] = []
     all_sources: list[dict] = []
 
-    # ── Intent detection ───────────────────────────────────────────────────
-    # FIX: Önce "Ekleme" niyetini özel olarak check ediyoruz
-    is_add_query = any(word in normalized_msg for word in ["ekle", "add", "koy", "ilave"])
-    
-    # Eğer ekleme talebi DEĞİLSE normal teklif detay okumasıdır
-    is_quote_query = (not is_add_query) and any(
-        word in normalized_msg
-        for word in [
-            "teklif", "quote", "sepet", "sipariş", "durum", "göster",
-            "listele", "içerik", "ne var", "neler var",
-        ]
-    )
+    is_add_query = any(w in normalized_msg for w in ["ekle", "add", "koy", "ilave"])
+    is_quote_query = (not is_add_query) and any(w in normalized_msg for w in ["teklif", "quote", "sepet", "siparis", "durum", "goster", "listele", "icerik", "ne var"])
 
-    is_product_query = (not is_quote_query) and (not is_add_query) and any(
-        word in normalized_msg
-        for word in [
-            "ürün", "okuyucu", "yazıcı", "terminal", "lisans", "kurulum",
-            "barkod", "fiyat", "stok", "öneri", "tavsiye",
-            "printer", "scanner", "device", "el terminali",
-        ]
-    )
+    is_product_query = (not is_quote_query) and (not is_add_query) and any(w in normalized_msg for w in [
+        "urun", "okuyucu", "yazici", "terminal", "lisans", "kurulum", "barkod", "fiyat", "stok", "oneri", "tavsiye",
+        "printer", "scanner", "device", "el terminali", "software", "yazilim", "hizmet", "servis", "service",
+        "modul", "entegrasyon", "uygulama", "program"
+    ])
 
-    is_policy_query = any(
-        word in normalized_msg
-        for word in [
-            "iade", "garanti", "teslimat", "politika", "kural", "uyumluluk",
-            "nasıl", "ne zaman", "kaç gün", "şart", "koşul", "indirim",
-        ]
-    )
+    is_policy_query = any(w in normalized_msg for w in ["iade", "garanti", "teslimat", "politika", "kural", "uyumluluk", "nasil", "ne zaman", "kac gun", "sart", "kosul", "indirim"])
 
     effective_max_price = request.max_price_try
     if effective_max_price is None:
-        price_match = re.search(r"(\d[\d.,]*)\s*(?:tl|try|lira|₺)", normalized_msg)
+        price_match = re.search(r"(\d[\d.,]*)\s*(?:tl|try|lira)", normalized_msg)
         if price_match:
             try:
                 effective_max_price = float(price_match.group(1).replace(",", "").replace(".", ""))
@@ -488,125 +581,104 @@ async def stream_chat_fallback(
         if effective_max_price is None:
             effective_max_price = _parse_turkish_number(normalized_msg)
 
-    # ── 1. ADIM: Ekleme Senaryosu (ADD TO QUOTE) ───────────────────────────
-    if is_add_query and request.quote_id:
-        # Adet bulma: "2 adet", "5 tane" veya sadece sayı "3"
+    if is_add_query and active_quote_id:
         quantity = 1
-        qty_match = re.search(r"(\d+)\s*(?:adet|tane|line)?", normalized_msg)
+        turkish_numbers = {"bir": 1, "iki": 2, "uc": 3, "dort": 4, "bes": 5}
+        for w, num in turkish_numbers.items():
+            if w in normalized_msg:
+                quantity = num
+                break
+        qty_match = re.search(r"(\d+)\s*(?:adet|tane)", normalized_msg)
         if qty_match:
             quantity = int(qty_match.group(1))
 
-        # Önce sepete eklenecek ürünü veritabanında isminden bulalım
         sequence_num += 1
-        search_res = await search_products(
-            db, SearchProductsInput(query=request.message, limit=1), session_id, sequence_num, skip_logging=True
-        )
-        products = search_res.get("products", [])
+        try:
+            search_res = await search_products(db, SearchProductsInput(query=request.message, limit=1), session_id, sequence_num, skip_logging=True)
+        except Exception:
+            search_res = {"products": []}
 
+        products = search_res.get("products", [])
         if products:
             target_prod = products[0]
             sequence_num += 1
-            
-            # Gerçek ekleme fonksiyonunu (tool) çağırıyoruz:
-            yield (
-                f"event: tool_start\ndata: "
-                f"{json.dumps({'tool': 'add_to_quote', 'input': {'quote_id': request.quote_id, 'product_id': target_prod['id'], 'quantity': quantity}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-            )
-
-            add_res = await add_to_quote(
-                db, 
-                AddToQuoteInput(
-                    quote_id=request.quote_id, 
-                    product_id=target_prod["id"], 
-                    quantity=quantity,
-                    allow_backorder=True
-                ), 
-                session_id, 
-                sequence_num
-            )
+            yield f"event: tool_start\ndata: {json.dumps({'tool': 'add_to_quote', 'input': {'quote_id': active_quote_id, 'product_id': target_prod['id'], 'quantity': quantity}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
+            try:
+                add_res = await add_to_quote(db, AddToQuoteInput(quote_id=active_quote_id, product_id=target_prod["id"], quantity=quantity, allow_backorder=True), session_id, sequence_num)
+            except Exception as e:
+                add_res = {"error": str(e)}
 
             if "error" not in add_res:
-                response_parts.append(f"✅ **{target_prod['name']}** ürününden {quantity} adet başarıyla teklifinize eklendi.")
-                # Güncel sepet özetini de hemen altına iliştirelim
-                quote_now = await get_quote(db, GetQuoteInput(quote_id=request.quote_id), session_id, sequence_num)
-                if "error" not in quote_now:
-                    response_parts.append(f"Güncel Teklif Toplamı: **{quote_now.get('total_try', 0):,.0f} TRY**")
+                response_parts.append(f"**{target_prod['name']}** urununden {quantity} adet basariyla teklifinize eklendi.")
+                try:
+                    quote_now = await get_quote(db, GetQuoteInput(quote_id=active_quote_id), session_id, sequence_num)
+                    if "error" not in quote_now:
+                        response_parts.append(f"Guncel Teklif Toplami: **{quote_now.get('total_try', 0):,.0f} TRY**")
+                except Exception:
+                    pass
             else:
-                response_parts.append(f"⚠️ Teklife ekleme yapılırken bir hata oluştu: {add_res.get('error')}")
+                response_parts.append(f"Teklife ekleme yapilirken bir hata olustu: {add_res.get('error')}")
 
             quote_delta = add_res.get("quote_delta") or ({"action": "add", "product_id": target_prod["id"], "new_quantity": quantity} if "error" not in add_res else None)
-            yield (
-                f"event: tool_result\ndata: "
-                f"{json.dumps({'tool': 'add_to_quote', 'success': 'error' not in add_res, 'quote_delta': quote_delta, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-            )
+            yield f"event: tool_result\ndata: {json.dumps({'tool': 'add_to_quote', 'success': 'error' not in add_res, 'quote_delta': quote_delta, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
         else:
-            response_parts.append("Eklenecek uygun bir ürün bulunamadı. Lütfen ürün ismini net yazın.")
+            response_parts.append("Eklenecek uygun bir urun bulunamadi. Lutfen urun ismini net yazin.")
 
-    # ── 2. ADIM: Normal Teklif Gösterimi ───────────────────────────────────
-    elif is_quote_query and request.quote_id:
+    elif is_quote_query and active_quote_id:
         sequence_num += 1
-        yield (
-            f"event: tool_start\ndata: "
-            f"{json.dumps({'tool': 'get_quote', 'input': {'quote_id': request.quote_id}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
-        quote_result = await get_quote(db, GetQuoteInput(quote_id=request.quote_id), session_id, sequence_num)
+        yield f"event: tool_start\ndata: {json.dumps({'tool': 'get_quote', 'input': {'quote_id': active_quote_id}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
+        try:
+            quote_result = await get_quote(db, GetQuoteInput(quote_id=active_quote_id), session_id, sequence_num)
+        except Exception as e:
+            quote_result = {"error": str(e)}
+
         if "error" not in quote_result:
             items = quote_result.get("items", [])
             total = quote_result.get("total_try", 0)
             if items:
-                response_parts.append(f"Teklifinizde {len(items)} kalem bulunmaktadır (Toplam: {total:,.0f} TRY):")
+                response_parts.append(f"Teklifinizde {len(items)} kalem bulunmaktadir (Toplam: {total:,.0f} TRY):")
                 for item in items:
                     response_parts.append(f"- **{item.get('product_name', item.get('product_id', '?'))}** | Adet: {item.get('quantity', '?')} | Birim: {item.get('unit_price_try', 0):,.0f} TRY")
             else:
-                response_parts.append("Teklifiniz henüz boş.")
+                response_parts.append("Teklifiniz henuz bos.")
         else:
-            response_parts.append(f"Teklif bilgisi alınamadı: {quote_result.get('error')}")
+            response_parts.append(f"Teklif bilgisi alinamadi: {quote_result.get('error')}")
 
-        yield (
-            f"event: tool_result\ndata: "
-            f"{json.dumps({'tool': 'get_quote', 'success': 'error' not in quote_result, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
+        yield f"event: tool_result\ndata: {json.dumps({'tool': 'get_quote', 'success': 'error' not in quote_result, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
 
-    elif is_quote_query and not request.quote_id:
-        response_parts.append("Aktif bir teklif oturumu bulunamadı. Lütfen önce bir teklif oluşturun.")
+    elif is_quote_query and not active_quote_id:
+        response_parts.append("Aktif bir teklif oturumu bulunamadi. Lutfen once bir teklif olusturun.")
 
-    # ── 3. ADIM: Bilgi Havuzu Sorguları ────────────────────────────────────
     if is_policy_query or (not is_product_query and not is_quote_query and not is_add_query):
         sequence_num += 1
-        yield (
-            f"event: tool_start\ndata: "
-            f"{json.dumps({'tool': 'get_knowledge_entries', 'input': {'query': request.message}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
-        knowledge_result = await get_knowledge_entries(db, GetKnowledgeInput(query=request.message, limit=3), session_id, sequence_num, skip_logging=True)
-        entries = knowledge_result.get("knowledge_entries", [])
-        for entry in entries:
+        yield f"event: tool_start\ndata: {json.dumps({'tool': 'get_knowledge_entries', 'input': {'query': request.message}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
+        try:
+            knowledge_result = await get_knowledge_entries(db, GetKnowledgeInput(query=request.message, limit=3), session_id, sequence_num, skip_logging=True)
+        except Exception as e:
+            knowledge_result = {"knowledge_entries": [], "error": str(e)}
+
+        for entry in knowledge_result.get("knowledge_entries", []):
             kid = entry["knowledge_id"]
             source_ids.append(kid)
             all_sources.append({"type": "knowledge", "id": kid, "name": entry.get("title", "")})
             body = entry.get("content") or entry.get("body") or ""
-            if body:
-                response_parts.append(f"**{entry['title']}**: {body}")
-            else:
-                response_parts.append(f"**{entry['title']}**")
+            response_parts.append(f"**{entry['title']}**: {body}" if body else f"**{entry['title']}**")
 
-        yield (
-            f"event: tool_result\ndata: "
-            f"{json.dumps({'tool': 'get_knowledge_entries', 'success': True, 'count': len(entries), 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
+        yield f"event: tool_result\ndata: {json.dumps({'tool': 'get_knowledge_entries', 'success': 'error' not in knowledge_result, 'count': len(knowledge_result.get('knowledge_entries', [])), 'sequence': sequence_num, 'session_id': session_id})}\n\n"
 
-    # ── 4. ADIM: Ürün Listeleme/Arama ──────────────────────────────────────
     if is_product_query:
         sequence_num += 1
-        search_input = SearchProductsInput(query=request.message, max_price_try=effective_max_price, in_stock_only=True, limit=5)
-        yield (
-            f"event: tool_start\ndata: "
-            f"{json.dumps({'tool': 'search_products', 'input': {'query': request.message, 'max_price_try': effective_max_price}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
-        product_result = await search_products(db, search_input, session_id, sequence_num, skip_logging=True)
+        search_input = SearchProductsInput(query=request.message, max_price_try=effective_max_price, in_stock_only=True, limit=10)
+        yield f"event: tool_start\ndata: {json.dumps({'tool': 'search_products', 'input': {'query': request.message, 'max_price_try': effective_max_price}, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
+        try:
+            product_result = await search_products(db, search_input, session_id, sequence_num, skip_logging=True)
+        except Exception as e:
+            product_result = {"products": [], "error": str(e)}
+
         products = product_result.get("products", [])
         if products:
-            price_note = f" ({effective_max_price:,.0f} TRY altı)" if effective_max_price else ""
-            response_parts.append(f"İlgili ürünler{price_note}:")
+            price_note = f" ({effective_max_price:,.0f} TRY alti)" if effective_max_price else ""
+            response_parts.append(f"İlgili urunler{price_note}:")
             for prod in products:
                 pid = prod["id"]
                 source_ids.append(pid)
@@ -614,34 +686,31 @@ async def stream_chat_fallback(
                 response_parts.append(f"- **{prod['name']}** | {prod['price_try']:,.0f} TRY | Stok: {prod['stock']}")
         else:
             if effective_max_price:
-                fallback_result = await search_products(db, SearchProductsInput(query=request.message, max_price_try=None, in_stock_only=True, limit=3), session_id, sequence_num, skip_logging=True)
-                fallback_products = fallback_result.get("products", [])
+                try:
+                    fallback_result = await search_products(db, SearchProductsInput(query=request.message, max_price_try=None, in_stock_only=True, limit=5), session_id, sequence_num, skip_logging=True)
+                    fallback_products = fallback_result.get("products", [])
+                except Exception:
+                    fallback_products = []
+
                 if fallback_products:
-                    response_parts.append(f"{effective_max_price:,.0f} TRY altında stokta uygun ürün bulunamadı. En yakın alternatifler:")
+                    response_parts.append(f"{effective_max_price:,.0f} TRY altinda stokta uygun urun bulunamadi. En yakin alternatifler:")
                     for prod in fallback_products:
                         pid = prod["id"]
                         source_ids.append(pid)
                         all_sources.append({"type": "product", "id": pid, "name": prod.get("name", "")})
                         response_parts.append(f"- **{prod['name']}** | {prod['price_try']:,.0f} TRY | Stok: {prod['stock']}")
                 else:
-                    response_parts.append(f"Arama kriterlerinize uygun stokta ürün bulunamadı ({effective_max_price:,.0f} TRY altında).")
+                    response_parts.append(f"Arama kriterlerinize uygun stokta urun bulunamadi ({effective_max_price:,.0f} TRY altinda).")
             else:
-                response_parts.append("Arama kriterlerinize uygun stokta ürün bulunamadı.")
+                response_parts.append("Arama kriterlerinize uygun stokta urun bulunamadi.")
 
-        yield (
-            f"event: tool_result\ndata: "
-            f"{json.dumps({'tool': 'search_products', 'success': True, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
-        )
+        yield f"event: tool_result\ndata: {json.dumps({'tool': 'search_products', 'success': 'error' not in product_result, 'sequence': sequence_num, 'session_id': session_id})}\n\n"
 
-    # ── 5. ADIM: Çıktıları İletme ve Kapatma ────────────────────────────────
     if all_sources:
-        yield (
-            f"event: sources\ndata: "
-            f"{json.dumps({'sources': all_sources, 'session_id': session_id})}\n\n"
-        )
+        yield f"event: sources\ndata: {json.dumps({'sources': all_sources, 'session_id': session_id})}\n\n"
 
     if not response_parts:
-        response_parts.append("Sorunuzu anlayamadım. Lütfen ürün adı, kategori veya politika konusu belirterek tekrar sorun.")
+        response_parts.append("Sorunuzu anlayamadim. Lutfen urun adi, kategori veya politika konusu belirterek tekrar sorun.")
 
     full_response = "\n".join(response_parts)
     unique_source_ids = list(dict.fromkeys(source_ids))
@@ -657,18 +726,13 @@ async def stream_chat_fallback(
     if buffer.strip():
         yield f"event: text_chunk\ndata: {json.dumps({'text': buffer, 'session_id': session_id})}\n\n"
 
-    yield (
-        f"event: done\ndata: "
-        f"{json.dumps({'session_id': session_id, 'type': 'done', 'mode': 'fallback', 'sources': unique_source_ids})}\n\n"
-    )
-
+    yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'type': 'done', 'mode': 'fallback', 'sources': unique_source_ids})}\n\n"
 
 async def handle_chat_stream(
     request: ChatRequest,
     db: AsyncSession,
 ) -> AsyncGenerator[str, None]:
     try:
-        # ── Resolve or create session ──────────────────────────────────────
         session: ChatSession | None = None
 
         if request.session_id:
@@ -680,79 +744,56 @@ async def handle_chat_stream(
             session = result.scalar_one_or_none()
 
         if session is None:
-            # Resolve or create quote
             quote_id: str = request.quote_id or ""
             if not quote_id:
                 from app.models.models import Quote as QuoteModel
-
-                new_quote = QuoteModel(
-                    id=str(uuid.uuid4()),
-                    customer_id=request.customer_id,
-                )
+                new_quote = QuoteModel(id=str(uuid.uuid4()), customer_id=request.customer_id)
                 db.add(new_quote)
                 await db.flush()
-                quote_id = new_quote.id  # primitive str — safe after flush
+                quote_id = new_quote.id
 
-            session = ChatSession(
-                id=str(uuid.uuid4()),
-                quote_id=quote_id,
-                customer_id=request.customer_id,
-            )
+            session = ChatSession(id=str(uuid.uuid4()), quote_id=quote_id, customer_id=request.customer_id)
             db.add(session)
             await db.flush()
 
-        # ── FIX: extract all primitives from ORM objects BEFORE commit ─────
         session_id_str: str = str(session.id)
         session_quote_id_str: str | None = str(session.quote_id) if session.quote_id else None
 
-        # Convert message history to plain dicts now — do not keep ORM refs.
-        # IMPORTANT: Use __dict__ to check whether 'messages' was actually
-        # eagerly loaded (selectinload only runs for existing sessions).
-        # Accessing session.messages on a *newly created* ChatSession would
-        # trigger an implicit lazy-load, which raises MissingGreenlet in an
-        # async context.
         loaded_messages = session.__dict__.get("messages") or []
-        safe_messages_list: list[dict] = [
-            {"role": m.role, "content": m.content}
-            for m in loaded_messages
-        ]
-
-        # Append the new user message (plain dict first, ORM object to DB)
+        safe_messages_list: list[dict] = [{"role": m.role, "content": m.content} for m in loaded_messages]
         safe_messages_list.append({"role": "user", "content": request.message})
 
-        user_msg = ChatMessage(
-            id=str(uuid.uuid4()),
-            session_id=session_id_str,
-            role="user",
-            content=request.message,
-        )
+        user_msg = ChatMessage(id=str(uuid.uuid4()), session_id=session_id_str, role="user", content=request.message)
         db.add(user_msg)
-
-        # COMMIT ALL database operations BEFORE starting the generator
         await db.commit()
-        # After this commit we only use *_str primitives and safe_messages_list
 
-        # Propagate resolved quote_id into request for downstream tools
         if not request.quote_id and session_quote_id_str:
             request = request.model_copy(update={"quote_id": session_quote_id_str})
 
-        # ── Delegate to LLM or fallback ────────────────────────────────────
-        if settings.llm_enabled:
-            async for event in stream_chat_llm(
-                request, db, session_id_str, safe_messages_list, session_quote_id_str
-            ):
-                yield event
+        llm_available = settings.llm_enabled and bool(settings.OPENAI_API_KEY)
+
+        logger.info(f"CHAT MODE - LLM_AVAILABLE: {llm_available}, Session: {session_id_str}, Quote: {session_quote_id_str}")
+
+        if llm_available:
+            logger.info("STARTING IN LLM MODE")
+            yield f"event: mode\ndata: {json.dumps({'mode': 'llm', 'session_id': session_id_str})}\n\n"
+            try:
+                async for event in stream_chat_llm(request, db, session_id_str, safe_messages_list, session_quote_id_str):
+                    yield event
+            except Exception as e:
+                logger.error(f"LLM ERROR: {type(e).__name__}: {e}", exc_info=True)
+                logger.warning("FALLING BACK TO FALLBACK MODE")
+                yield f"event: mode\ndata: {json.dumps({'mode': 'fallback', 'reason': 'llm_error', 'session_id': session_id_str})}\n\n"
+                async for event in stream_chat_fallback(request, db, session_id_str, session_quote_id_str):
+                    yield event
         else:
-            async for event in stream_chat_fallback(request, db, session_id_str):
+            logger.warning("STARTING IN FALLBACK MODE")
+            yield f"event: mode\ndata: {json.dumps({'mode': 'fallback', 'session_id': session_id_str})}\n\n"
+            async for event in stream_chat_fallback(request, db, session_id_str, session_quote_id_str):
                 yield event
 
     except Exception as stream_exc:
-        import traceback
+        logger.error(f"STREAM EXCEPTION: {type(stream_exc).__name__}: {stream_exc}", exc_info=True)
+        yield f"event: error\ndata: {json.dumps({'error': str(stream_exc), 'session_id': request.session_id if request.session_id else 'unknown'})}\n\n"
 
-        print("\n" + "=" * 60)
-        print("🚨 STREAM ERROR:")
-        print("=" * 60)
-        traceback.print_exc()
-        print("=" * 60 + "\n")
-        yield f"event: error\ndata: {json.dumps({'error': str(stream_exc)})}\n\n"
-
+        

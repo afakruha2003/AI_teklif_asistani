@@ -1,20 +1,21 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Colors, Spacing, Radius, Typography } from '../utils/theme';
-import { QuoteItem } from '../types';
+import { QuoteItem, QuoteItemStatus } from '../types';
 
 interface Props {
   item: QuoteItem;
 }
 
-const STATUS_CONFIG = {
+const STATUS_CONFIG: Record<QuoteItemStatus, { label: string; color: string }> = {
   active: { label: 'Aktif', color: Colors.statusActive },
   replaced: { label: 'Değiştirildi', color: Colors.statusReplaced },
   passive: { label: 'Pasif', color: Colors.statusPassive },
+  removed: { label: 'Kaldırıldı', color: Colors.statusPassive },
 };
 
 export const QuoteItemCard: React.FC<Props> = ({ item }) => {
-  const statusCfg = STATUS_CONFIG[item.status] ?? STATUS_CONFIG.passive;
+  const statusCfg = STATUS_CONFIG[item.status];
   const isActive = item.status === 'active';
 
   return (
@@ -30,7 +31,7 @@ export const QuoteItemCard: React.FC<Props> = ({ item }) => {
             </Text>
           </View>
         </View>
-        <Text style={styles.sku}>{item.sku}</Text>
+        {item.sku ? <Text style={styles.sku}>{item.sku}</Text> : null}
       </View>
 
       <View style={styles.footer}>
@@ -42,21 +43,21 @@ export const QuoteItemCard: React.FC<Props> = ({ item }) => {
         <View style={styles.qtyRow}>
           <Text style={styles.label}>Birim Fiyat</Text>
           <Text style={styles.value}>
-            {item.unit_price.toLocaleString('tr-TR')} ₺
+            {item.unit_price_try.toLocaleString('tr-TR')} ₺
           </Text>
         </View>
         <View style={styles.divider} />
         <View style={styles.qtyRow}>
           <Text style={styles.label}>Toplam</Text>
           <Text style={[styles.value, styles.total, !isActive && styles.lineThrough]}>
-            {item.total_price.toLocaleString('tr-TR')} ₺
+            {item.line_total_try.toLocaleString('tr-TR')} ₺
           </Text>
         </View>
       </View>
 
-      {item.discount && item.discount > 0 ? (
+      {item.discount_pct > 0 ? (
         <View style={styles.discountBadge}>
-          <Text style={styles.discountText}>%{item.discount} indirim uygulandı</Text>
+          <Text style={styles.discountText}>%{item.discount_pct} indirim uygulandı</Text>
         </View>
       ) : null}
     </View>

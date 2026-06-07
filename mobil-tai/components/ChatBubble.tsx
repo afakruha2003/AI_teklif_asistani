@@ -56,7 +56,7 @@ export const ChatBubble: React.FC<Props> = ({ message }) => {
 
 function formatTime(date: Date): string {
   try {
-    return date.toLocaleTimeString('tr-TR', {
+    return (date || new Date()).toLocaleTimeString('tr-TR', {
       hour: '2-digit',
       minute: '2-digit',
     });

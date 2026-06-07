@@ -18,17 +18,20 @@ import { QuoteItem } from '../types';
 export default function QuoteScreen() {
   const { quote, isLoading, fetchQuote } = useQuoteStore();
   const { quoteId } = useChatStore();
+  const isValidQuoteId = !!(quoteId && quoteId !== 'null' && quoteId !== 'None');
 
   const load = useCallback(() => {
-    if (quoteId) fetchQuote(quoteId);
-  }, [quoteId]);
+    if (isValidQuoteId) {
+      fetchQuote(quoteId);
+    }
+  }, [quoteId, isValidQuoteId, fetchQuote]);
 
   useEffect(() => {
     load();
-  }, [quoteId]);
+  }, [quoteId, load]);
 
-  const activeItems = quote?.items.filter((i: QuoteItem) => i.status === 'active') ?? [];
-  const inactiveItems = quote?.items.filter((i: QuoteItem) => i.status !== 'active') ?? [];
+  const activeItems = quote?.items?.filter((i: QuoteItem) => i.status === 'active') ?? [];
+  const inactiveItems = quote?.items?.filter((i: QuoteItem) => i.status !== 'active') ?? [];
 
   const renderItem = ({ item }: { item: QuoteItem }) => (
     <QuoteItemCard item={item} />
@@ -56,9 +59,7 @@ export default function QuoteScreen() {
       <View style={styles.summaryRow}>
         <Text style={styles.totalLabel}>Toplam</Text>
         <Text style={styles.totalValue}>
-          {quote
-            ? `${quote.total.toLocaleString('tr-TR')} ${quote.currency}`
-            : '—'}
+          {quote ? `${quote.total_try.toLocaleString('tr-TR')} ${quote.currency ?? 'TRY'}` : '—'}
         </Text>
       </View>
       {quote?.updated_at && (
@@ -69,7 +70,7 @@ export default function QuoteScreen() {
     </View>
   );
 
-  if (!quoteId && !quote) {
+  if (!isValidQuoteId && !quote) {
     return (
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
@@ -91,9 +92,11 @@ export default function QuoteScreen() {
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Teklif</Text>
-        <TouchableOpacity onPress={load} style={styles.refreshBtn}>
-          <Text style={styles.refreshText}>↻ Yenile</Text>
-        </TouchableOpacity>
+        {isValidQuoteId && (
+          <TouchableOpacity onPress={load} style={styles.refreshBtn}>
+            <Text style={styles.refreshText}>↻ Yenile</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {isLoading && !quote ? (
@@ -129,6 +132,7 @@ export default function QuoteScreen() {
               refreshing={isLoading}
               onRefresh={load}
               tintColor={Colors.primary}
+              enabled={isValidQuoteId}
             />
           }
           showsVerticalScrollIndicator={false}
