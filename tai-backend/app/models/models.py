@@ -10,7 +10,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-# Bizim core/database.py içindeki ortak çatımız
 from app.core.database import Base
 
 def _uuid() -> str:
@@ -18,8 +17,6 @@ def _uuid() -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-# ─── Enums ────────────────────────────────────────────────────────────────────
 
 class QuoteStatus(str, enum.Enum):
     draft = "draft"
@@ -40,19 +37,21 @@ class CustomerSegment(str, enum.Enum):
 class KnowledgeCategory(str, enum.Enum):
     return_policy = "return_policy"
     delivery = "delivery"
+    delivery_policy = "delivery_policy"
     warranty = "warranty"
     pricing = "pricing"
     stock = "stock"
     compatibility = "compatibility"
+    compliance = "compliance"
     fallback = "fallback"
     installation = "installation"
     general = "general"
+    region_rules = "region_rules"
+    software_compatibility = "software_compatibility"
 
 class ToolCallStatus(str, enum.Enum):
     success = "success"
     error = "error"
-
-# ─── Product ──────────────────────────────────────────────────────────────────
 
 class Product(Base):
     __tablename__ = "products"
@@ -64,15 +63,15 @@ class Product(Base):
     price_try: Mapped[float] = mapped_column(Numeric(12, 2, asdecimal=False), nullable=False)
     stock: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sku: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
-    
-    aliases: Mapped[list] = mapped_column(JSONB, default=list)  # LLM'in eş anlamlı kelimeleri bulması için kritik!
+
+    aliases: Mapped[list] = mapped_column(JSONB, default=list)
     tags: Mapped[list] = mapped_column(JSONB, default=list)
-    
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     alternative_product_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("products.id", ondelete="SET NULL"), nullable=True
     )
-    
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -88,7 +87,6 @@ class Product(Base):
         Index("ix_products_price_try", "price_try"),
     )
 
-# ─── Knowledge Entry ──────────────────────────────────────────────────────────
 
 class KnowledgeEntry(Base):
     __tablename__ = "knowledge_entries"
@@ -108,46 +106,42 @@ class KnowledgeEntry(Base):
         Index("ix_knowledge_category", "category"),
     )
 
-# ─── Customer ─────────────────────────────────────────────────────────────────
-
 class Customer(Base):
     __tablename__ = "customers"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)  # Yetkili Kişi Adı
-    company_name: Mapped[Optional[str]] = mapped_column(String(255)) # EKLEDİK: Şirket Adı (Senaryolar için hayati)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    company_name: Mapped[Optional[str]] = mapped_column(String(255))
     email: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
     segment: Mapped[CustomerSegment] = mapped_column(
         SAEnum(CustomerSegment, name="customer_segment_enum"),
         default=CustomerSegment.standard,
     )
-    allow_backorder: Mapped[bool] = mapped_column(Boolean, default=False) # Stok yoksa siparişe izin var mı?
+    allow_backorder: Mapped[bool] = mapped_column(Boolean, default=False)
     price_level: Mapped[str] = mapped_column(String(50), default="standard")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     quotes: Mapped[List["Quote"]] = relationship("Quote", back_populates="customer")
 
-# ─── Price Rule ───────────────────────────────────────────────────────────────
 
 class PriceRule(Base):
     __tablename__ = "price_rules"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)  # Kural Açıklaması (Örn: "Partner %10 İndirim")
-    segment: Mapped[Optional[str]] = mapped_column(String(50))      # Hangi segmente özel?
-    category: Mapped[Optional[str]] = mapped_column(String(100))    # Hangi kategoriye özel?
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    segment: Mapped[Optional[str]] = mapped_column(String(50))
+    category: Mapped[Optional[str]] = mapped_column(String(100))
     product_id: Mapped[Optional[str]] = mapped_column(String(64), ForeignKey("products.id", ondelete="SET NULL"))
-    
-    min_quantity: Mapped[int] = mapped_column(Integer, default=1)   # EKLEDİK: Miktar İndirimi Eşiği (Örn: 10 adet ve üzeri)
+
+    min_quantity: Mapped[int] = mapped_column(Integer, default=1)
     discount_pct: Mapped[float] = mapped_column(Numeric(5, 2, asdecimal=False), default=0)
-    priority: Mapped[int] = mapped_column(Integer, default=0)       # EKLEDİK: Çakışan kurallarda hangisi üstün?
-    
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     product: Mapped[Optional["Product"]] = relationship("Product", back_populates="price_rules")
 
-# ─── Quote ────────────────────────────────────────────────────────────────────
 
 class Quote(Base):
     __tablename__ = "quotes"
@@ -156,6 +150,7 @@ class Quote(Base):
     customer_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True
     )
+    session_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     status: Mapped[QuoteStatus] = mapped_column(
         SAEnum(QuoteStatus, name="quote_status_enum"), default=QuoteStatus.draft
     )
@@ -179,13 +174,13 @@ class QuoteItem(Base):
         String(64), ForeignKey("products.id", ondelete="RESTRICT"), nullable=False
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    unit_price_try: Mapped[float] = mapped_column(Numeric(12, 2, asdecimal=False), nullable=False) # Ham liste fiyatı
-    discount_pct: Mapped[float] = mapped_column(Numeric(5, 2, asdecimal=False), default=0)       # Uygulanan indirim oranı
+    unit_price_try: Mapped[float] = mapped_column(Numeric(12, 2, asdecimal=False), nullable=False)
+    discount_pct: Mapped[float] = mapped_column(Numeric(5, 2, asdecimal=False), default=0)
     status: Mapped[QuoteItemStatus] = mapped_column(
         SAEnum(QuoteItemStatus, name="quote_item_status_enum"),
         default=QuoteItemStatus.active,
     )
-    is_backorder: Mapped[bool] = mapped_column(Boolean, default=False) # Stok yetersiz ama siparişe onay verildi mi?
+    is_backorder: Mapped[bool] = mapped_column(Boolean, default=False)
     replaced_by_item_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("quote_items.id", ondelete="SET NULL"), nullable=True
     )
@@ -200,7 +195,6 @@ class QuoteItem(Base):
         Index("ix_quote_items_product_id", "product_id"),
     )
 
-# ─── Chat Session ─────────────────────────────────────────────────────────────
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
@@ -229,7 +223,7 @@ class ChatMessage(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
     )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user / assistant / tool
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -239,7 +233,6 @@ class ChatMessage(Base):
         Index("ix_chat_messages_session_id", "session_id"),
     )
 
-# ─── Tool Call Log ────────────────────────────────────────────────────────────
 
 class ToolCallLog(Base):
     __tablename__ = "tool_call_logs"
@@ -248,14 +241,14 @@ class ToolCallLog(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
     )
-    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True) # Mükerrer istek koruması
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     input_data: Mapped[Optional[dict]] = mapped_column(JSONB)
     output_data: Mapped[Optional[dict]] = mapped_column(JSONB)
     status: Mapped[ToolCallStatus] = mapped_column(
         SAEnum(ToolCallStatus, name="tool_call_status_enum"), default=ToolCallStatus.success
     )
-    quote_delta: Mapped[Optional[dict]] = mapped_column(JSONB) # Sepette ne değişti? (Miktar artışı, silme logu vb.)
+    quote_delta: Mapped[Optional[dict]] = mapped_column(JSONB)
     sequence_num: Mapped[int] = mapped_column(Integer, default=0)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -267,4 +260,3 @@ class ToolCallLog(Base):
         Index("ix_tool_call_logs_session_id", "session_id"),
         Index("ix_tool_call_logs_tool_name", "tool_name"),
     )
-    
