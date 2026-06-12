@@ -1,6 +1,18 @@
 import { Quote, Product, KnowledgeEntry, QuoteItem } from '../types';
+import { Platform } from 'react-native';
+import Constants from 'expo-constants';
 
-const LOCAL_IP_URL = 'http://localhost:8000/api/v1';
+const isEmulator = !Constants.isDevice;
+
+const LOCAL_IP_URL = Platform.select({
+  android: isEmulator
+    ? 'http://10.0.2.2:8000/api/v1'
+    : 'http://192.168.1.100:8000/api/v1',
+  ios: isEmulator
+    ? 'http://localhost:8000/api/v1'
+    : 'http://192.168.1.100:8000/api/v1',
+  default: 'http://localhost:8000/api/v1',
+})!;
 
 export const API_BASE_URL = (
   process.env.EXPO_PUBLIC_API_URL ?? LOCAL_IP_URL
